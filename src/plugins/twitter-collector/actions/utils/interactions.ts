@@ -22,6 +22,10 @@ import { ClientBase } from "./base";
 import { buildConversationThread, sendTweet, wait } from "./utils.ts";
 import { actions } from "@elizaos/plugin-bootstrap";
 
+const SCRAPE_BATCH_SIZE = 5; // Anzahl der Twitter-Accounts pro Durchlauf
+const SCRAPE_INTERVAL_MS = 4 * 60 * 1000; // Alle 4 Minuten wird ein Batch verarbeitet (3–5 Minuten je nach Wunsch)
+const SUMMARY_INTERVAL_MS = 30 * 60 * 1000; // Alle 30 Minuten wird eine Zusammenfassung erstellt
+
 export const twitterMessageHandlerTemplate =
   `
 # Areas of Expertise
@@ -91,12 +95,36 @@ Thread of Tweets You Are Replying To:
 # INSTRUCTIONS: Respond with [RESPOND] if {{agentName}} should respond, or [IGNORE] if {{agentName}} should not respond to the last message and [STOP] if {{agentName}} should stop participating in the conversation.
 ` + shouldRespondFooter;
 
+function chunkArray(array, size) {
+  const result = [];
+  for (let i = 0; i < array.length; i += size) {
+    result.push(array.slice(i, i + size));
+  }
+  return result;
+}
+
 export class TwitterInteractionClient {
   client: ClientBase;
   runtime: IAgentRuntime;
+  collectedTweets: Tweet[];
+  targetUserChunks: string[][];
+
+  currentChunkIndex: number;
   constructor(client: ClientBase, runtime: IAgentRuntime) {
     this.client = client;
     this.runtime = runtime;
+    this.collectedTweets = [];
+
+    // Aufteilen der konfigurierten User in Batches
+    this.targetUserChunks = [];
+    if (this.client.twitterConfig.TWITTER_TARGET_USERS?.length) {
+      this.targetUserChunks = chunkArray(
+        this.client.twitterConfig.TWITTER_TARGET_USERS,
+        SCRAPE_BATCH_SIZE
+      );
+    }
+    // Index, welcher Chunk als nächstes verarbeitet wird
+    this.currentChunkIndex = 0;
   }
 
   sendSummaryToTelegram = async (message: string) => {
@@ -146,310 +174,149 @@ export class TwitterInteractionClient {
     }
   };
 
+  /**
+   * Startet alle notwendigen Loops:
+   * 1) Scraping-Loop: sammelt alle 3–5 (im Beispiel 4) Minuten neue Tweets von einer Teilmenge von Accounts.
+   * 2) Summary-Loop: fasst alle 30 Minuten die gesammelten Tweets zusammen.
+   */
   async start() {
-    const handleTwitterInteractionsLoop = () => {
-      this.handleTwitterInteractions();
-      setTimeout(
-        handleTwitterInteractionsLoop,
-        // Defaults to 2 minutes
-        this.client.twitterConfig.TWITTER_POLL_INTERVAL * 1000
-      );
-    };
-    handleTwitterInteractionsLoop();
+    // Loop zum regelmäßigen Scrapen in Batches
+    this.startScrapingLoop();
+
+    // Loop zum regelmäßigen Erstellen einer Zusammenfassung
+    this.startSummaryLoop();
   }
 
-  async handleTwitterInteractions() {
-    elizaLogger.log("Checking Twitter interactions");
+  /**
+   * Startet den Loop, der in definierten Intervallen (z.B. alle 4 Minuten)
+   * jeweils einen Teil (Batch) der Twitter-Accounts abfragt.
+   */
+  startScrapingLoop() {
+    // Einmal beim Start direkt aufrufen
+    this.handleTwitterBatch();
 
-    const twitterUsername = this.client.profile.username;
-    const roomId = stringToUuid("twitter_generate_room-" + twitterUsername); // Globale roomId
-    try {
-      let allTweetCandidates = [];
+    // Anschließend per setInterval alle 3–5 Minuten
+    setInterval(() => {
+      this.handleTwitterBatch();
+    }, SCRAPE_INTERVAL_MS);
+  }
 
-      // Process target users if configured
-      if (this.client.twitterConfig.TWITTER_TARGET_USERS.length) {
-        const TARGET_USERS = this.client.twitterConfig.TWITTER_TARGET_USERS;
-        elizaLogger.log("Processing target users:", TARGET_USERS);
-
-        const tweetsByUser = new Map();
-
-        for (const username of TARGET_USERS) {
-          try {
-            const userTweets = (
-              await this.client.twitterClient.fetchSearchTweets(
-                `from:${username}`,
-                3,
-                SearchMode.Latest
-              )
-            ).tweets;
-
-            const validTweets = userTweets.filter((tweet) => {
-              const isUnprocessed =
-                !this.client.lastCheckedTweetId ||
-                parseInt(tweet.id) > this.client.lastCheckedTweetId;
-              const isRecent =
-                Date.now() - tweet.timestamp * 1000 < 2 * 60 * 60 * 1000;
-
-              elizaLogger.log(`Tweet ${tweet.id} checks:`, {
-                isUnprocessed,
-                isRecent,
-                isReply: tweet.isReply,
-                isRetweet: tweet.isRetweet,
-              });
-
-              return (
-                isUnprocessed && !tweet.isReply && !tweet.isRetweet && isRecent
-              );
-            });
-
-            if (validTweets.length > 0) {
-              tweetsByUser.set(username, validTweets);
-              elizaLogger.log(
-                `Found ${validTweets.length} valid tweets from ${username}`
-              );
-            }
-          } catch (error) {
-            elizaLogger.error(`Error fetching tweets for ${username}:`, error);
-            continue;
-          }
-        }
-
-        // Keep all valid tweets
-        tweetsByUser.forEach((tweets) => {
-          allTweetCandidates.push(...tweets);
-        });
-      } else {
-        elizaLogger.log("No target users configured, processing only mentions");
-      }
-
-      // Sort tweet candidates by ID in ascending order and remove self-tweets
-      allTweetCandidates = allTweetCandidates
-        .sort((a, b) => a.id.localeCompare(b.id))
-        .filter((tweet) => tweet.userId !== this.client.profile.id);
-
-      const processedTweets = [];
-
-      for (const tweet of allTweetCandidates) {
-        if (
-          !this.client.lastCheckedTweetId ||
-          BigInt(tweet.id) > this.client.lastCheckedTweetId
-        ) {
-          const tweetId = stringToUuid(tweet.id + "-" + this.runtime.agentId);
-          const existingResponse =
-            await this.runtime.messageManager.getMemoryById(tweetId);
-
-          if (existingResponse) {
-            elizaLogger.log(`Already processed tweet ${tweet.id}, skipping`);
-            continue;
-          }
-
-          elizaLogger.log("New Tweet found", tweet.permanentUrl);
-
-          const thread = await this.buildConversationThread(tweet);
-
-          if (thread.length === 1 && thread[0].id === tweet.id) {
-            elizaLogger.log("Single tweet, no thread needed:", tweet.id);
-            processedTweets.push({ tweet, thread: null });
-          } else {
-            elizaLogger.log("Thread built:", thread);
-            processedTweets.push({ tweet, thread });
-          }
-
-          const roomId = stringToUuid(
-            tweet.conversationId + "-" + this.runtime.agentId
-          );
-          const userIdUUID =
-            tweet.userId === this.client.profile.id
-              ? this.runtime.agentId
-              : stringToUuid(tweet.userId);
-
-          await this.runtime.ensureConnection(
-            userIdUUID,
-            roomId,
-            tweet.username,
-            tweet.name,
-            "twitter"
-          );
-
-          const state = await this.runtime.composeState(
-            {
-              id: tweetId,
-              agentId: this.runtime.agentId,
-              content: {
-                text: tweet.text,
-                url: tweet.permanentUrl,
-              },
-              userId: userIdUUID,
-              roomId,
-              createdAt: tweet.timestamp * 1000,
-            },
-            {
-              twitterClient: this.client.twitterClient,
-              twitterUserName: this.client.twitterConfig.TWITTER_USERNAME,
-              currentPost: tweet.text,
-              formattedConversation: thread
-                .map(
-                  (tweet) =>
-                    `@${tweet.username} (${new Date(
-                      tweet.timestamp * 1000
-                    ).toLocaleString("en-US", {
-                      hour: "2-digit",
-                      minute: "2-digit",
-                      month: "short",
-                      day: "numeric",
-                    })}):\n${tweet.text}`
-                )
-                .join("\n\n"),
-            }
-          );
-
-          this.client.saveRequestMessage(
-            {
-              id: tweetId,
-              agentId: this.runtime.agentId,
-              content: {
-                text: tweet.text,
-                url: tweet.permanentUrl,
-              },
-              userId: userIdUUID,
-              roomId,
-              createdAt: tweet.timestamp * 1000,
-            },
-            state
-          );
-
-          // console.log("tweet", tweet);
-
-          // this.client.lastCheckedTweetId = BigInt(tweet.id);
-        }
-      }
-
-      const allTexts = processedTweets.map(
-        (item) => `${item.tweet.username}: ${item.tweet.text}`
-      );
-
-      // Fasse die Texte in einem String zusammen, getrennt durch neue Zeilen
-      const combinedText = allTexts.join("\n\n");
-
-      // console.log("Combined Text:", combinedText);
-
-      // console.log("-----------------------------------------------");
-      // console.log(combinedText);
-      // console.log("-----------------------------------------------");
-      // Save the latest checked tweet ID to the file
-      // await this.client.cacheLatestCheckedTweetId();
-
-      if (combinedText.length === 0) {
-        console.error("Keine neuen Tweets gefunden.");
-        return "No new tweets found";
-      }
-
-      const relevantData = processedTweets.map((tweetObj) => {
-        const tweet = tweetObj.tweet;
-        return {
-          username: tweet.username,
-          text: tweet.text,
-        };
-      });
-
-      // console.log("Relevant data: ", relevantData);
-
-      const embeddings = await Promise.all(
-        relevantData.map((tweet) => embed(this.runtime, tweet.text))
-      );
-
-      // console.log(embeddings);
-
-      const tweetMemory = new MemoryManager({
-        runtime: this.runtime,
-        tableName: "tweetMemory",
-      });
-
-      // Durchsuche das Memory nach ähnlichen Inhalten für jedes Embedding
-
-      const searchResults = await Promise.all(
-        embeddings.map((embedding) =>
-          tweetMemory.searchMemoriesByEmbedding(embedding, {
-            match_threshold: 0.8, // Schwellenwert für die Ähnlichkeit
-            count: 5, // Anzahl der zurückgegebenen ähnlichen Erinnerungen
-            roomId, // ID des Raums, falls relevant
-          })
-        )
-      );
-      // console.log("-----------------------------------------------");
-      // console.log("Search Results: ", searchResults);
-      // console.log("-----------------------------------------------");
-
-      const state: State = await this.runtime.composeState({
-        userId: this.runtime.agentId,
-        roomId: roomId,
-        agentId: this.runtime.agentId,
-        content: { text: combinedText },
-      });
-
-      // console.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-      // console.log("content" + JSON.stringify(state));
-      // console.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-
-      // console.log("State:", state);
-
-      const context = composeContext({
-        state,
-        template: `Here are some recent tweets:
-        ${combinedText}
-  
-      Please order the topics in these tweets by relevance.
-      Score the relevance based on the number of tweets that mention the topic.
-      Make a summary of the relevant topics in these tweets.
-      Please name the authors of the tweets.
-      Don't add any new information, just summarize the topics.
-
-      Can you check the ${searchResults} if you have information about these topics?
-      If yes bring them in a context in a seperate section.
-      `,
-      });
-
-      // console.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-      // console.log("Context:", context);
-      // console.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-
-      const summary = await generateText({
-        runtime: this.runtime,
-        context,
-        modelClass: ModelClass.SMALL,
-      });
-
-      // console.log("Summary:", summary);
-
-      await this.sendSummaryToTelegram(summary);
-
-      for (const [index, embedding] of embeddings.entries()) {
-        const tweet = relevantData[index]; // Hole die zugehörigen Tweet-Daten
-
-        const memory = {
-          userId: this.runtime.agentId,
-          agentId: this.runtime.agentId,
-          content: {
-            text: tweet.text, // Text des Tweets
-            username: tweet.username, // Benutzername des Verfassers
-          },
-          roomId: stringToUuid(`twitter_memory-${tweet.username}`), // Raum-ID basierend auf Username
-          embedding: embedding, // Das generierte Embedding
-        };
-
-        try {
-          const savedMemory = await tweetMemory.addEmbeddingToMemory(memory); // Speicher das Embedding im Memory
-          console.log("Embedding erfolgreich gespeichert:", savedMemory);
-        } catch (error) {
-          console.error("Fehler beim Speichern des Embeddings:", error);
-        }
-      }
-
-      elizaLogger.log("Finished checking Twitter interactions");
-      return summary;
-    } catch (error) {
-      elizaLogger.error("Error handling Twitter interactions:", error.message);
+  /**
+   * Ruft den nächsten Batch von Twitter-Usern ab, holt deren Tweets,
+   * filtert sie und speichert sie in `this.collectedTweets`.
+   */
+  async handleTwitterBatch() {
+    // Falls es keine konfigurierten User gibt, nur Mentions oder Abbruch
+    if (!this.targetUserChunks.length) {
+      elizaLogger.log("Keine TWITTER_TARGET_USERS konfiguriert, breche ab.");
+      return;
     }
+
+    // Bestimmen, welcher Chunk als nächstes dran ist
+    const usersToFetch = this.targetUserChunks[this.currentChunkIndex] || [];
+    elizaLogger.log(
+      `Verarbeite Chunk ${this.currentChunkIndex + 1}/${
+        this.targetUserChunks.length
+      }:`,
+      usersToFetch
+    );
+
+    try {
+      // Sammle die Tweets des aktuellen Batches
+      const newTweets = await this.fetchAndFilterTweets(usersToFetch);
+
+      // Für Logging/Debugging
+      elizaLogger.log(
+        `Anzahl neuer Tweets aus dem Batch ${this.currentChunkIndex + 1}:`,
+        newTweets.length
+      );
+
+      // Neue Tweets in gesammelten Pool übernehmen
+      this.collectedTweets.push(...newTweets);
+    } catch (error) {
+      elizaLogger.error("Fehler beim Abfragen der Tweets:", error);
+    }
+
+    // Index inkrementieren, wenn wir das Ende erreicht haben, wieder auf 0 setzen
+    this.currentChunkIndex++;
+    if (this.currentChunkIndex >= this.targetUserChunks.length) {
+      this.currentChunkIndex = 0;
+    }
+  }
+
+  /**
+   * Startet den Loop, der alle 30 Minuten eine Zusammenfassung erstellt.
+   */
+  startSummaryLoop() {
+    // Optional: Beim Start kannst du einmalig direkt eine Zusammenfassung erstellen
+    // this.processAndSummarizeCollectedTweets();
+
+    setInterval(() => {
+      this.processAndSummarizeCollectedTweets();
+    }, SUMMARY_INTERVAL_MS);
+  }
+
+  /**
+   * Fragt Twitter nach neuesten Tweets der gegebenen User ab,
+   * filtert sie anhand deiner Kriterien (z.B. isReply, isRetweet, Zeitfenster)
+   * und gibt die validen Tweets zurück.
+   */
+  async fetchAndFilterTweets(usersArray) {
+    const allValidTweets = [];
+
+    for (const username of usersArray) {
+      try {
+        // Beispiel: Fetch 3 neueste Tweets des Nutzers
+        const userTweets = (
+          await this.client.twitterClient.fetchSearchTweets(
+            `from:${username}`,
+            3,
+            SearchMode.Latest
+          )
+        ).tweets;
+
+        // Filterkriterien
+        const validTweets = userTweets.filter((tweet) => {
+          const isUnprocessed =
+            !this.client.lastCheckedTweetId ||
+            BigInt(tweet.id) > this.client.lastCheckedTweetId;
+          const isRecent =
+            Date.now() - tweet.timestamp * 1000 < 2 * 60 * 60 * 1000;
+
+          elizaLogger.log(`Tweet ${tweet.id} checks:`, {
+            isUnprocessed,
+            isRecent,
+            isReply: tweet.isReply,
+            isRetweet: tweet.isRetweet,
+          });
+
+          return (
+            isUnprocessed && !tweet.isReply && !tweet.isRetweet && isRecent
+          );
+        });
+
+        if (validTweets.length > 0) {
+          elizaLogger.log(
+            `Gefundene gültige Tweets von ${username}:`,
+            validTweets.length
+          );
+          allValidTweets.push(...validTweets);
+        }
+      } catch (error) {
+        elizaLogger.error(
+          `Fehler beim Abfragen der Tweets für ${username}:`,
+          error
+        );
+        continue;
+      }
+    }
+
+    // Sortiere gefundene Tweets aufsteigend nach ID und entferne ggf. eigene
+    const tweetCandidates = allValidTweets
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .filter((tweet) => tweet.userId !== this.client.profile.id);
+
+    return tweetCandidates;
   }
 
   async buildConversationThread(tweet, maxReplies = 10) {
@@ -482,6 +349,263 @@ export class TwitterInteractionClient {
 
     await processThread(tweet);
     return thread;
+  }
+
+  /**
+   * Wird alle 30 Minuten aufgerufen:
+   * - verarbeitet (bei Bedarf) die gesammelten Tweets weiter,
+   * - baut Threads (Conversation Thread),
+   * - generiert eine Zusammenfassung,
+   * - speichert Embeddings im Memory.
+   * Anschließend können die gesammelten Tweets geleert werden, falls gewünscht.
+   */
+  async processAndSummarizeCollectedTweets() {
+    elizaLogger.log("Starte Prozessierung der gesammelten Tweets.");
+
+    // Wenn keine neuen Tweets vorliegen, abbrechen
+    if (this.collectedTweets.length === 0) {
+      elizaLogger.log(
+        "Keine gesammelten Tweets vorhanden, keine Zusammenfassung."
+      );
+      return;
+    }
+
+    // 1) Baue für jeden neuen Tweet optional den Conversation-Thread
+    // 2) Erstelle State, Memory-Einträge, etc.
+
+    const processedTweets = [];
+    for (const tweet of this.collectedTweets) {
+      // Check, ob Tweet bereits verarbeitet wurde
+      const tweetId = stringToUuid(tweet.id + "-" + this.runtime.agentId);
+      const existingResponse = await this.runtime.messageManager.getMemoryById(
+        tweetId
+      );
+
+      if (existingResponse) {
+        elizaLogger.log(
+          `Tweet ${tweet.id} wurde bereits verarbeitet, überspringe.`
+        );
+        continue;
+      }
+
+      // Baue Conversation-Thread (falls gewünscht/erforderlich)
+      const thread = await this.buildConversationThread(tweet);
+
+      elizaLogger.log("Neuer Tweet gefunden:", tweet.permanentUrl);
+
+      if (thread.length === 1 && thread[0].id === tweet.id) {
+        elizaLogger.log("Einzel-Tweet ohne vorherige Konversation:", tweet.id);
+        processedTweets.push({ tweet, thread: null });
+      } else {
+        elizaLogger.log("Thread aufgebaut:", thread);
+        processedTweets.push({ tweet, thread });
+      }
+
+      // Vorbereiten einer Connection und State
+      const roomId = stringToUuid(
+        tweet.conversationId + "-" + this.runtime.agentId
+      );
+      const userIdUUID =
+        tweet.userId === this.client.profile.id
+          ? this.runtime.agentId
+          : stringToUuid(tweet.userId);
+
+      await this.runtime.ensureConnection(
+        userIdUUID,
+        roomId,
+        tweet.username,
+        tweet.name,
+        "twitter"
+      );
+
+      const state = await this.runtime.composeState(
+        {
+          id: tweetId,
+          agentId: this.runtime.agentId,
+          content: {
+            text: tweet.text,
+            url: tweet.permanentUrl,
+          },
+          userId: userIdUUID,
+          roomId,
+          createdAt: tweet.timestamp * 1000,
+        },
+        {
+          twitterClient: this.client.twitterClient,
+          twitterUserName: this.client.twitterConfig.TWITTER_USERNAME,
+          currentPost: tweet.text,
+          formattedConversation: thread
+            .map(
+              (twt) =>
+                `@${twt.username} (${new Date(
+                  twt.timestamp * 1000
+                ).toLocaleString("en-US", {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                  month: "short",
+                  day: "numeric",
+                })}):\n${twt.text}`
+            )
+            .join("\n\n"),
+        }
+      );
+
+      // Speichere die Anfrage im internen System
+      this.client.saveRequestMessage(
+        {
+          id: tweetId,
+          agentId: this.runtime.agentId,
+          content: {
+            text: tweet.text,
+            url: tweet.permanentUrl,
+          },
+          userId: userIdUUID,
+          roomId,
+          createdAt: tweet.timestamp * 1000,
+        },
+        state
+      );
+    }
+
+    // Alle verarbeiteten Tweets in einem String zusammenfassen
+    const allTexts = processedTweets.map(
+      (item) =>
+        `${item.tweet.username}: ${item.tweet.text} [Link](${item.tweet.permanentUrl})`
+    );
+
+    const combinedText = allTexts.join("\n\n");
+
+    if (!combinedText) {
+      elizaLogger.log(
+        "Keine neuen verarbeiteten Tweets vorhanden, Zusammenfassung entfällt."
+      );
+      return;
+    }
+
+    // Relevante Daten extrahieren
+    const relevantData = processedTweets.map((tweetObj) => {
+      const tweet = tweetObj.tweet;
+      return {
+        username: tweet.username,
+        text: tweet.text,
+      };
+    });
+
+    // Embeddings generieren und ggf. ins Memory einpflegen
+    const embeddings = await Promise.all(
+      relevantData.map((tweet) => embed(this.runtime, tweet.text))
+    );
+
+    const tweetMemory = new MemoryManager({
+      runtime: this.runtime,
+      tableName: "tweetMemory",
+    });
+
+    // Optionale Suche nach ähnlichen Inhalten im Memory:
+    // (im Beispiel führen wir das pro relevanten Tweet durch)
+    const roomId = stringToUuid(
+      "twitter_generate_room-" + this.client.profile.username
+    );
+    const searchResults = await Promise.all(
+      embeddings.map((embedding) =>
+        tweetMemory.searchMemoriesByEmbedding(embedding, {
+          match_threshold: 0.8,
+          count: 5,
+          roomId,
+        })
+      )
+    );
+
+    // State für den Summarizer erzeugen (kombinierter Text).
+    const state = await this.runtime.composeState({
+      userId: this.runtime.agentId,
+      roomId: roomId,
+      agentId: this.runtime.agentId,
+      content: { text: combinedText },
+    });
+
+    const context = composeContext({
+      state,
+      template: `
+      Here are some recent tweets:
+      ${combinedText}
+      
+      Task:
+      
+      1. Analyze each tweet in detail and extract the specific information mentioned (e.g., data points, quotes, claims, or observations).
+      2. Organize the topics by relevance, scoring the relevance based on the number of mentions or depth of discussion.
+      3. Summarize each relevant topic by providing specific details mentioned in the tweets.
+      4. Identify the authors of the tweets and attribute the details to them.
+      5. Make the summary concise yet detailed enough to understand the key takeaways of each tweet.
+      
+      Optional:
+      If additional information is found in the ${searchResults}, connect it to the context in a separate section, highlighting how it supports or extends the tweets' content.
+      
+      Output format (Telegram-ready):
+      🔥 Ordered Topics (with relevance score):
+      1️⃣ Topic 1 (Relevance: ⭐⭐⭐⭐)
+          - Key point 1
+          - Key point 2
+      2️⃣ Topic 2 (Relevance: ⭐⭐⭐)
+          - Key point 1
+          - Key point 2
+      
+      📋 Detailed Summary:
+      🔹 Topic 1: 
+          - Specific detail 1
+          - Specific detail 2
+      🔹 Topic 2: 
+          - Specific detail 1
+          - Specific detail 2
+      
+      👤 Authors and Details:
+      - @Author1: Mentioned *Topic 1* with [Tweet Link](link)
+      - @Author2: Mentioned *Topic 2* with [Tweet Link](link)
+      
+      📖 Additional Information (if applicable):
+      🔸 Extended information: Summary of additional findings from ${searchResults}.
+      `,
+    });
+
+    // Generiere eine Zusammenfassung mit dem LLM/Modell deiner Wahl
+    const summary = await generateText({
+      runtime: this.runtime,
+      context,
+      modelClass: ModelClass.SMALL, // hier ggf. anpassen
+    });
+
+    // Verschicke die Summary z.B. via Telegram (oder an anderes Ziel)
+    await this.sendSummaryToTelegram(summary);
+
+    // Speichere Embeddings ins Memory
+    for (const [index, embedding] of embeddings.entries()) {
+      const tweet = relevantData[index];
+
+      const memory = {
+        userId: this.runtime.agentId,
+        agentId: this.runtime.agentId,
+        content: {
+          text: tweet.text,
+          username: tweet.username,
+        },
+        roomId: stringToUuid(`twitter_memory-${tweet.username}`),
+        embedding: embedding,
+      };
+
+      try {
+        const savedMemory = await tweetMemory.addEmbeddingToMemory(memory);
+        elizaLogger.log("Embedding erfolgreich gespeichert:", savedMemory);
+      } catch (error) {
+        elizaLogger.error("Fehler beim Speichern des Embeddings:", error);
+      }
+    }
+
+    // Optional: Nachdem die Tweets verarbeitet und die Zusammenfassung erstellt wurde,
+    // können wir das Array leeren, damit bei der nächsten Zusammenfassung
+    // nur neue Tweets einfließen.
+    this.collectedTweets = [];
+
+    elizaLogger.log("Zusammenfassung erstellt und Embeddings gespeichert.");
   }
 
   // async handleTwitterInteractions() {
