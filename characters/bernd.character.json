@@ -1,6 +1,6 @@
 {
   "name": "Bernd - BMaster",
-  "clients": ["telegram"],
+  "clients": [],
   "modelProvider": "anthropic",
   "settings": {
     "model": "claude-3-sonnet-20240229",

@@ -75,7 +75,7 @@ export const collectTweets: Action = {
       });
       return true;
     } catch (error) {
-      console.error("Fehler bei der Blogpost-Action:", error);
+      console.error("Fehler bei der Action:", error);
       _callback({
         text: "Es gab einen Fehler. Bitte versuche es später erneut.",
         action: "TWITTER_COLLECTOR_ERROR",

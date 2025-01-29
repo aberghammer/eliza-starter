@@ -24,6 +24,7 @@ import {
 } from "./config/index.ts";
 import { initializeDatabase } from "./database/index.ts";
 import { collectTwitter } from "./plugins/twitter-collector/index.ts";
+import { scrapeTelegramChannels } from "./plugins/telegram-scraper/index.ts"
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -58,6 +59,7 @@ export function createAgent(
     character,
     plugins: [
       collectTwitter,
+      scrapeTelegramChannels,
       bootstrapPlugin,
       nodePlugin,
       character.settings?.secrets?.WALLET_PUBLIC_KEY ? solanaPlugin : null,

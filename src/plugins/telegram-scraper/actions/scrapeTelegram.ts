@@ -1,4 +1,4 @@
-import { elizaLogger, ModelClass } from "@elizaos/core";
+import { elizaLogger } from "@elizaos/core";
 import {
   ActionExample,
   HandlerCallback,
@@ -7,23 +7,14 @@ import {
   State,
   type Action,
 } from "@elizaos/core";
-import { Api, TelegramClient } from "telegram";
-import { StringSession } from "telegram/sessions";
+import { TelegramClient } from "telegram";
+import { sessions } from 'telegram';
+import { TelegramClientBase } from "./utils/base.ts";
 
 // ✅ Telegram API-Daten
-const apiId = parseInt(process.env.API_ID || "0");
-const apiHash = process.env.API_HASH || "";
-const sessionString = process.env.TG_SESSION || "";
-const channelUsername = process.env.TG_CHANNEL || ""; // Trading-Gruppe/Kanal
-
-const client = new TelegramClient(
-  new StringSession(sessionString),
-  apiId,
-  apiHash,
-  {
-    connectionRetries: 5,
-  }
-);
+const apiId = parseInt(process.env.TELEGRAM_APP_ID || "0");
+const apiHash = process.env.TELEGRAM_API_HASH || "";
+const channelUsername = process.env.TELEGRAM_BOSSMAN_CHANNEL || ""; // Trading-Gruppe/Kanal
 
 export const scrapeTelegram: Action = {
   name: "SCRAPE_TELEGRAM",
@@ -44,23 +35,23 @@ export const scrapeTelegram: Action = {
     try {
       elizaLogger.log("📡 Telegram Scraper gestartet...");
 
-      await client.start({
-        phoneNumber: async () => process.env.TG_PHONE || "",
-        password: async () => process.env.TG_PASSWORD || "",
-        phoneCode: async () => {
-          throw new Error("Manual login required. Use session string.");
-        },
-        onError: (err) => console.error(err),
-      });
+      // ✅ Initialisiere den Scraper mit API-Daten und Eliza-Runtime
+      const scraper = new TelegramClientBase(apiId, apiHash, _runtime);
+
+      elizaLogger.log("📡 Scraper initialisiert...");
+
+      // 🔥 WICHTIG: Hier MUSS await stehen, sonst läuft der Code weiter, bevor init() fertig ist!
+      await scraper.init();
 
       elizaLogger.log("✅ Erfolgreich mit Telegram verbunden!");
 
-   
+      const summary =  await scraper.fetchLatestMessages(channelUsername)
 
       _callback({
-        text: `🚀 Telegram Scraper läuft und überwacht ${channelUsername}`,
+        text: `🚀 Telegram Scraper läuft und überwacht ${summary}`,
         action: "TELEGRAM_SCRAPER_ACTIVE",
       });
+
       return true;
     } catch (error) {
       console.error("❌ Fehler beim Telegram Scraper:", error);
@@ -68,6 +59,7 @@ export const scrapeTelegram: Action = {
         text: "Es gab einen Fehler. Bitte versuche es später erneut.",
         action: "TELEGRAM_SCRAPER_ERROR",
       });
+
       return false;
     }
   },
