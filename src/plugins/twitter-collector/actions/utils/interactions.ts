@@ -492,9 +492,9 @@ export class TwitterInteractionClient {
     });
 
     // Embeddings generieren und ggf. ins Memory einpflegen
-    const embeddings = await Promise.all(
-      relevantData.map((tweet) => embed(this.runtime, tweet.text))
-    );
+    // const embeddings = await Promise.all(
+    //   relevantData.map((tweet) => embed(this.runtime, tweet.text))
+    // );
 
     const tweetMemory = new MemoryManager({
       runtime: this.runtime,
@@ -506,15 +506,15 @@ export class TwitterInteractionClient {
     const roomId = stringToUuid(
       "twitter_generate_room-" + this.client.profile.username
     );
-    const searchResults = await Promise.all(
-      embeddings.map((embedding) =>
-        tweetMemory.searchMemoriesByEmbedding(embedding, {
-          match_threshold: 0.8,
-          count: 5,
-          roomId,
-        })
-      )
-    );
+    // const searchResults = await Promise.all(
+    //   embeddings.map((embedding) =>
+    //     tweetMemory.searchMemoriesByEmbedding(embedding, {
+    //       match_threshold: 0.8,
+    //       count: 5,
+    //       roomId,
+    //     })
+    //   )
+    // );
 
     // State für den Summarizer erzeugen (kombinierter Text).
     const state = await this.runtime.composeState({
@@ -538,8 +538,6 @@ export class TwitterInteractionClient {
       4. Identify the authors of the tweets and attribute the details to them.
       5. Make the summary concise yet detailed enough to understand the key takeaways of each tweet.
       
-      Optional:
-      If additional information is found in the ${searchResults}, connect it to the context in a separate section, highlighting how it supports or extends the tweets' content.
       
       Output format (Telegram-ready):
       🔥 Ordered Topics (with relevance score):
@@ -562,8 +560,7 @@ export class TwitterInteractionClient {
       - @Author1: Mentioned *Topic 1* with [Tweet Link](link)
       - @Author2: Mentioned *Topic 2* with [Tweet Link](link)
       
-      📖 Additional Information (if applicable):
-      🔸 Extended information: Summary of additional findings from ${searchResults}.
+
       `,
     });
 
@@ -578,27 +575,27 @@ export class TwitterInteractionClient {
     await this.sendSummaryToTelegram(summary);
 
     // Speichere Embeddings ins Memory
-    for (const [index, embedding] of embeddings.entries()) {
-      const tweet = relevantData[index];
+    // for (const [index, embedding] of embeddings.entries()) {
+    //   const tweet = relevantData[index];
 
-      const memory = {
-        userId: this.runtime.agentId,
-        agentId: this.runtime.agentId,
-        content: {
-          text: tweet.text,
-          username: tweet.username,
-        },
-        roomId: stringToUuid(`twitter_memory-${tweet.username}`),
-        embedding: embedding,
-      };
+    //   const memory = {
+    //     userId: this.runtime.agentId,
+    //     agentId: this.runtime.agentId,
+    //     content: {
+    //       text: tweet.text,
+    //       username: tweet.username,
+    //     },
+    //     roomId: stringToUuid(`twitter_memory-${tweet.username}`),
+    //     embedding: embedding,
+    //   };
 
-      try {
-        const savedMemory = await tweetMemory.addEmbeddingToMemory(memory);
-        elizaLogger.log("Embedding erfolgreich gespeichert:", savedMemory);
-      } catch (error) {
-        elizaLogger.error("Fehler beim Speichern des Embeddings:", error);
-      }
-    }
+    //   try {
+    //     const savedMemory = await tweetMemory.addEmbeddingToMemory(memory);
+    //     elizaLogger.log("Embedding erfolgreich gespeichert:", savedMemory);
+    //   } catch (error) {
+    //     elizaLogger.error("Fehler beim Speichern des Embeddings:", error);
+    //   }
+    // }
 
     // Optional: Nachdem die Tweets verarbeitet und die Zusammenfassung erstellt wurde,
     // können wir das Array leeren, damit bei der nächsten Zusammenfassung
